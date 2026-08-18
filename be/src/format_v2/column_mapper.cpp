@@ -197,6 +197,10 @@ std::string virtual_column_type_to_string(TableVirtualColumnType type) {
         return "LAST_UPDATED_SEQUENCE_NUMBER";
     case TableVirtualColumnType::ICEBERG_ROWID:
         return "ICEBERG_ROWID";
+    case TableVirtualColumnType::FILE_PATH:
+        return "FILE_PATH";
+    case TableVirtualColumnType::FILE_ROW_POS:
+        return "FILE_ROW_POS";
     }
     return "UNKNOWN";
 }
@@ -427,7 +431,8 @@ std::string TableColumnMapperOptions::debug_string() const {
     out << "TableColumnMapperOptions{mode=" << mapping_mode_to_string(mode)
         << ", reject_missing_required_field=" << reject_missing_required_field
         << ", allow_idless_complex_wrapper_projection=" << allow_idless_complex_wrapper_projection
-        << ", enable_row_lineage_virtual_columns=" << enable_row_lineage_virtual_columns << "}";
+        << ", enable_row_lineage_virtual_columns=" << enable_row_lineage_virtual_columns
+        << ", file_metadata_column_flavor=" << static_cast<int>(file_metadata_column_flavor) << "}";
     return out.str();
 }
 
@@ -1412,6 +1417,68 @@ static TableVirtualColumnType row_lineage_virtual_column_type(const ColumnDefini
     return TableVirtualColumnType::INVALID;
 }
 
+static constexpr const char* FILE_METADATA_FILE_PATH = "_file";
+static constexpr const char* FILE_METADATA_ROW_POS = "_pos";
+static constexpr int32_t FILE_METADATA_FILE_PATH_FIELD_ID = 2147483646;
+static constexpr int32_t FILE_METADATA_ROW_POS_FIELD_ID = 2147483645;
+static constexpr const char* PAIMON_FILE_METADATA_FILE_PATH = "__paimon_file_path";
+static constexpr const char* PAIMON_FILE_METADATA_ROW_POS = "__paimon_row_index";
+static constexpr int32_t PAIMON_FILE_METADATA_FILE_PATH_FIELD_ID = 2147483644;
+static constexpr int32_t PAIMON_FILE_METADATA_ROW_POS_FIELD_ID = 2147483643;
+
+// 按列名识别 Iceberg/Paimon 的物理位置元数据列。
+static TableVirtualColumnType file_metadata_virtual_column_type(
+        const std::string& column_name, FileMetadataColumnFlavor flavor) {
+    if ((flavor == FileMetadataColumnFlavor::ICEBERG &&
+         column_name == FILE_METADATA_FILE_PATH) ||
+        (flavor == FileMetadataColumnFlavor::PAIMON &&
+         column_name == PAIMON_FILE_METADATA_FILE_PATH)) {
+        return TableVirtualColumnType::FILE_PATH;
+    }
+    if ((flavor == FileMetadataColumnFlavor::ICEBERG && column_name == FILE_METADATA_ROW_POS) ||
+        (flavor == FileMetadataColumnFlavor::PAIMON &&
+         column_name == PAIMON_FILE_METADATA_ROW_POS)) {
+        return TableVirtualColumnType::FILE_ROW_POS;
+    }
+    return TableVirtualColumnType::INVALID;
+}
+
+// 按保留字段 ID 识别 Iceberg/Paimon 的物理位置元数据列。
+static TableVirtualColumnType file_metadata_virtual_column_type_by_field_id(
+        const ColumnDefinition& column, FileMetadataColumnFlavor flavor) {
+    if (!column.has_identifier_field_id()) {
+        return TableVirtualColumnType::INVALID;
+    }
+    const auto field_id = column.get_identifier_field_id();
+    if ((flavor == FileMetadataColumnFlavor::ICEBERG &&
+         field_id == FILE_METADATA_FILE_PATH_FIELD_ID) ||
+        (flavor == FileMetadataColumnFlavor::PAIMON &&
+         field_id == PAIMON_FILE_METADATA_FILE_PATH_FIELD_ID)) {
+        return TableVirtualColumnType::FILE_PATH;
+    }
+    if ((flavor == FileMetadataColumnFlavor::ICEBERG &&
+         field_id == FILE_METADATA_ROW_POS_FIELD_ID) ||
+        (flavor == FileMetadataColumnFlavor::PAIMON &&
+         field_id == PAIMON_FILE_METADATA_ROW_POS_FIELD_ID)) {
+        return TableVirtualColumnType::FILE_ROW_POS;
+    }
+    return TableVirtualColumnType::INVALID;
+}
+
+// 根据当前映射模式选择元数据列的识别键。
+static TableVirtualColumnType file_metadata_virtual_column_type(const ColumnDefinition& column,
+                                                                TableColumnMappingMode mode,
+                                                                FileMetadataColumnFlavor flavor) {
+    switch (mode) {
+    case TableColumnMappingMode::BY_FIELD_ID:
+        return file_metadata_virtual_column_type_by_field_id(column, flavor);
+    case TableColumnMappingMode::BY_NAME:
+    case TableColumnMappingMode::BY_INDEX:
+        return file_metadata_virtual_column_type(column.name, flavor);
+    }
+    return TableVirtualColumnType::INVALID;
+}
+
 // Returns true when the current file type is not the exact nested type the scan should expose.
 // This is about building the projected file-side type/projection, not about whether TableReader
 // later needs to rematerialize the complex value back to table layout.
@@ -2242,8 +2309,15 @@ Status TableColumnMapper::_create_mapping_for_column(const ColumnDefinition& tab
             _options.enable_row_lineage_virtual_columns
                     ? row_lineage_virtual_column_type(table_column, _options.mode)
                     : TableVirtualColumnType::INVALID;
-    if (const auto* partition_value = find_partition_value(table_column, _partition_values);
-        table_column.is_partition_key && partition_value != nullptr) {
+    const auto file_metadata_type =
+            file_metadata_virtual_column_type(
+                    table_column, _options.mode, _options.file_metadata_column_flavor);
+    if (file_metadata_type != TableVirtualColumnType::INVALID) {
+        mapping->virtual_column_type = file_metadata_type;
+        mapping->filter_conversion = FilterConversionType::FINALIZE_ONLY;
+    } else if (const auto* partition_value =
+                       find_partition_value(table_column, _partition_values);
+               table_column.is_partition_key && partition_value != nullptr) {
         // Partition values are split constants and must take precedence over defaults.
         _set_constant_mapping(mapping, VExprContext::create_shared(VLiteral::create_shared(
                                                mapping->table_type, *partition_value)));

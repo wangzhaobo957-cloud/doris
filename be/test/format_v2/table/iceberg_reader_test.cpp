@@ -1047,13 +1047,33 @@ Block build_table_block(const std::vector<ColumnDefinition>& columns) {
 void expect_nullable_int64_column_values(const IColumn& column,
                                          const std::vector<int64_t>& expected_values) {
     const auto full_column = column.convert_to_full_column_if_const();
-    const auto& nullable_column = assert_cast<const ColumnNullable&>(*full_column);
-    const auto& values =
-            assert_cast<const ColumnInt64&>(nullable_column.get_nested_column()).get_data();
-    ASSERT_EQ(nullable_column.size(), expected_values.size());
+    const auto* nullable_column = check_and_get_column<ColumnNullable>(full_column.get());
+    const auto* nested = nullable_column != nullptr ? &nullable_column->get_nested_column()
+                                                    : full_column.get();
+    const auto& values = assert_cast<const ColumnInt64&>(*nested).get_data();
+    ASSERT_EQ(full_column->size(), expected_values.size());
     for (size_t row = 0; row < expected_values.size(); ++row) {
-        EXPECT_EQ(nullable_column.get_null_map_data()[row], 0);
+        if (nullable_column != nullptr) {
+            EXPECT_EQ(nullable_column->get_null_map_data()[row], 0);
+        }
         EXPECT_EQ(values[row], expected_values[row]);
+    }
+}
+
+// 校验可空字符串列全部为非空且等于预期值。
+void expect_nullable_string_column_values(const IColumn& column,
+                                          const std::vector<std::string>& expected_values) {
+    const auto full_column = column.convert_to_full_column_if_const();
+    const auto* nullable_column = check_and_get_column<ColumnNullable>(full_column.get());
+    const auto* nested = nullable_column != nullptr ? &nullable_column->get_nested_column()
+                                                    : full_column.get();
+    const auto& values = assert_cast<const ColumnString&>(*nested);
+    ASSERT_EQ(full_column->size(), expected_values.size());
+    for (size_t row = 0; row < expected_values.size(); ++row) {
+        if (nullable_column != nullptr) {
+            EXPECT_EQ(nullable_column->get_null_map_data()[row], 0);
+        }
+        EXPECT_EQ(values.get_data_at(row).to_string(), expected_values[row]);
     }
 }
 
@@ -2125,6 +2145,60 @@ TEST(IcebergV2ReaderTest, IcebergRowidVirtualColumnUsesDataFilePosition) {
     expect_iceberg_rowid_column_values(*block.get_by_position(0).column, original_file_path, {1, 2},
                                        17, partition_data_json);
     expect_int32_column_values(*block.get_by_position(1).column, {2, 3});
+
+    ASSERT_TRUE(reader.close().ok());
+    std::filesystem::remove_all(test_dir);
+}
+
+TEST(IcebergV2ReaderTest, PhysicalLocationMetadataUsesOriginalPathAndAbsoluteRowPosition) {
+    const auto test_dir =
+            std::filesystem::temp_directory_path() / "doris_iceberg_file_metadata_test";
+    std::filesystem::remove_all(test_dir);
+    std::filesystem::create_directories(test_dir);
+
+    const auto file_path = (test_dir / "split.parquet").string();
+    write_int_pair_parquet_file(file_path, {1, 2, 3}, {10, 20, 30}, {"one", "two", "three"});
+
+    std::vector<ColumnDefinition> projected_columns;
+    auto file_column =
+            make_table_column(2147483646, "_file", std::make_shared<DataTypeString>());
+    file_column.type = std::make_shared<DataTypeString>();
+    projected_columns.push_back(std::move(file_column));
+    auto position_column =
+            make_table_column(2147483645, "_pos", std::make_shared<DataTypeInt64>());
+    position_column.type = std::make_shared<DataTypeInt64>();
+    projected_columns.push_back(std::move(position_column));
+    projected_columns.push_back(make_table_column(0, "id", std::make_shared<DataTypeInt32>()));
+
+    RuntimeState state {TQueryOptions(), TQueryGlobals()};
+    doris::format::iceberg::IcebergTableReader reader;
+    ASSERT_TRUE(reader.init({
+                                    .projected_columns = projected_columns,
+                                    .conjuncts = {prepared_conjunct(
+                                            &state, table_int32_greater_than_expr(2, 2, 1))},
+                                    .format = FileFormat::PARQUET,
+                                    .scan_params = nullptr,
+                                    .io_ctx = nullptr,
+                                    .runtime_state = &state,
+                                    .scanner_profile = nullptr,
+                            })
+                        .ok());
+
+    auto split_options = build_split_options(file_path);
+    const auto original_file_path = "s3://bucket/table/data/original.parquet";
+    set_iceberg_rowid_params(&split_options, original_file_path, 17, R"({"part":"p1"})");
+    ASSERT_TRUE(reader.prepare_split(split_options).ok());
+
+    Block block = build_table_block(projected_columns);
+    bool eos = false;
+    ASSERT_TRUE(reader.get_block(&block, &eos).ok());
+    ASSERT_FALSE(eos);
+
+    ASSERT_EQ(block.rows(), 2);
+    expect_nullable_string_column_values(*block.get_by_position(0).column,
+                                         {original_file_path, original_file_path});
+    expect_nullable_int64_column_values(*block.get_by_position(1).column, {1, 2});
+    expect_int32_column_values(*block.get_by_position(2).column, {2, 3});
 
     ASSERT_TRUE(reader.close().ok());
     std::filesystem::remove_all(test_dir);

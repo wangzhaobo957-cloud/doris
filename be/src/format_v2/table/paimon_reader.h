@@ -57,12 +57,33 @@ protected:
     Status annotate_file_schema(std::vector<format::ColumnDefinition>* file_schema) override;
     Status customize_file_scan_request(format::FileScanRequest* file_request) override;
 
+    // 开启 Paimon 物理位置元数据列映射。
+    void configure_mapper_options(format::TableColumnMapperOptions* options) const override {
+        options->file_metadata_column_flavor = format::FileMetadataColumnFlavor::PAIMON;
+    }
+
+    // 在普通列转换完成后生成文件路径和绝对行号。
+    Status materialize_virtual_columns(Block* table_block) override;
+
     Status _parse_deletion_vector_file(const TTableFormatFileDesc& t_desc, DeleteFileDesc* desc,
                                        bool* has_delete_file) override;
 
 private:
+    // 返回当前 native split 的数据文件路径。
+    std::string _data_file_path() const;
+    // 为每个输出行填充当前数据文件路径。
+    Status _materialize_file_path(Block* table_block, size_t column_idx);
+    // 将文件读取器的绝对行号复制到表块。
+    Status _materialize_file_row_pos(Block* table_block, size_t column_idx);
+    // 请求底层文件读取器输出绝对行号。
+    Status _append_row_position_output_column(format::FileScanRequest* request);
+    // 判断投影结果是否需要文件原生行号。
+    bool _need_file_row_pos() const;
+
     int64_t _split_schema_id = -1;
     std::vector<format::LocalColumnIndex> _variant_schema_overrides;
+    size_t _row_position_block_position = 0;
+    std::string _original_file_path;
 };
 
 // Paimon scans can contain both native data-file splits and serialized JNI splits in the same

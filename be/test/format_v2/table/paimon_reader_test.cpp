@@ -194,6 +194,38 @@ const IColumn& expect_not_null_table_column(const Block& block, size_t position)
     return expect_not_null_nullable_nested_column(*block.get_by_position(position).column);
 }
 
+// 校验可空字符串列全部为非空且等于预期值。
+void expect_nullable_string_column_values(const IColumn& column,
+                                          const std::vector<std::string>& expected_values) {
+    const auto* nullable_column = check_and_get_column<ColumnNullable>(&column);
+    const auto* nested =
+            nullable_column != nullptr ? &nullable_column->get_nested_column() : &column;
+    const auto& values = assert_cast<const ColumnString&>(*nested);
+    ASSERT_EQ(column.size(), expected_values.size());
+    for (size_t row = 0; row < expected_values.size(); ++row) {
+        if (nullable_column != nullptr) {
+            EXPECT_EQ(nullable_column->get_null_map_data()[row], 0);
+        }
+        EXPECT_EQ(values.get_data_at(row).to_string(), expected_values[row]);
+    }
+}
+
+// 校验可空整数列全部为非空且等于预期值。
+void expect_nullable_int64_column_values(const IColumn& column,
+                                         const std::vector<int64_t>& expected_values) {
+    const auto* nullable_column = check_and_get_column<ColumnNullable>(&column);
+    const auto* nested =
+            nullable_column != nullptr ? &nullable_column->get_nested_column() : &column;
+    const auto& values = assert_cast<const ColumnInt64&>(*nested).get_data();
+    ASSERT_EQ(column.size(), expected_values.size());
+    for (size_t row = 0; row < expected_values.size(); ++row) {
+        if (nullable_column != nullptr) {
+            EXPECT_EQ(nullable_column->get_null_map_data()[row], 0);
+        }
+        EXPECT_EQ(values[row], expected_values[row]);
+    }
+}
+
 std::shared_ptr<arrow::Array> build_int32_array(const std::vector<int32_t>& values) {
     arrow::Int32Builder builder;
     for (const auto value : values) {
@@ -714,6 +746,70 @@ TEST(PaimonReaderTest, AppliesBitmapDeletionVectorFile) {
         }
     }
     EXPECT_EQ(ids, std::vector<int32_t>({2, 3, 4}));
+
+    ASSERT_TRUE(reader.close().ok());
+    std::filesystem::remove_all(test_dir);
+}
+
+TEST(PaimonReaderTest, PhysicalLocationMetadataUsesDataFilePathAndAbsoluteRowPosition) {
+    const auto test_dir =
+            std::filesystem::temp_directory_path() / "doris_paimon_file_metadata_test";
+    std::filesystem::remove_all(test_dir);
+    std::filesystem::create_directories(test_dir);
+
+    const auto file_path = (test_dir / "split.parquet").string();
+    write_int_pair_parquet_file(file_path, {1, 2, 3}, {10, 20, 30}, {"one", "two", "three"});
+
+    std::vector<ColumnDefinition> projected_columns;
+    auto file_column = make_table_column(2147483644, "__paimon_file_path",
+                                         std::make_shared<DataTypeString>());
+    file_column.type = std::make_shared<DataTypeString>();
+    projected_columns.push_back(std::move(file_column));
+    auto position_column = make_table_column(2147483643, "__paimon_row_index",
+                                             std::make_shared<DataTypeInt64>());
+    position_column.type = std::make_shared<DataTypeInt64>();
+    projected_columns.push_back(std::move(position_column));
+    projected_columns.push_back(
+            make_table_column(0, "id", std::make_shared<DataTypeInt32>()));
+    RuntimeProfile profile("test_profile");
+    RuntimeState state {TQueryOptions(), TQueryGlobals()};
+    auto scan_params = make_local_parquet_scan_params();
+    io::FileReaderStats file_reader_stats;
+    io::FileCacheStatistics file_cache_stats;
+    auto io_ctx = make_io_context(&file_reader_stats, &file_cache_stats);
+
+    paimon::PaimonReader reader;
+    ASSERT_TRUE(reader.init({
+                                    .projected_columns = projected_columns,
+                                    .conjuncts = {},
+                                    .format = FileFormat::PARQUET,
+                                    .scan_params = &scan_params,
+                                    .io_ctx = io_ctx,
+                                    .runtime_state = &state,
+                                    .scanner_profile = &profile,
+                            })
+                        .ok());
+
+    auto split_options = build_split_options(file_path);
+    const auto original_file_path = "oss://bucket/table/data/original.parquet";
+    TTableFormatFileDesc table_format_params;
+    TPaimonFileDesc paimon_params;
+    paimon_params.__set_file_format("parquet");
+    paimon_params.__set_original_file_path(original_file_path);
+    table_format_params.__set_paimon_params(paimon_params);
+    split_options.current_range.__set_table_format_params(table_format_params);
+    ASSERT_TRUE(reader.prepare_split(split_options).ok());
+
+    Block block = build_table_block(projected_columns);
+    bool eos = false;
+    ASSERT_TRUE(reader.get_block(&block, &eos).ok());
+    ASSERT_FALSE(eos);
+
+    ASSERT_EQ(block.rows(), 3);
+    expect_nullable_string_column_values(*block.get_by_position(0).column,
+                                         {original_file_path, original_file_path,
+                                          original_file_path});
+    expect_nullable_int64_column_values(*block.get_by_position(1).column, {0, 1, 2});
 
     ASSERT_TRUE(reader.close().ok());
     std::filesystem::remove_all(test_dir);

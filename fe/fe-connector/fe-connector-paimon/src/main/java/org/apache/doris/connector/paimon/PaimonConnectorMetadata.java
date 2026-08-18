@@ -76,6 +76,10 @@ import java.util.Set;
 public class PaimonConnectorMetadata implements ConnectorMetadata {
 
     private static final Logger LOG = LogManager.getLogger(PaimonConnectorMetadata.class);
+    private static final String PAIMON_FILE_PATH_COL = "__paimon_file_path";
+    private static final String PAIMON_ROW_INDEX_COL = "__paimon_row_index";
+    private static final int PAIMON_FILE_PATH_FIELD_ID = 2147483644;
+    private static final int PAIMON_ROW_INDEX_FIELD_ID = 2147483643;
 
     private final PaimonCatalogOps catalogOps;
     private final PaimonTypeMapping.Options typeMappingOptions;
@@ -376,6 +380,16 @@ public class PaimonConnectorMetadata implements ConnectorMetadata {
     private ConnectorTableSchema buildTableSchema(String tableName, Table table, List<DataField> fields,
             List<String> partitionKeys, List<String> primaryKeys) {
         List<ConnectorColumn> columns = mapFields(fields, primaryKeys);
+
+        // 仅数据表具备可由 native reader 合成的文件路径和绝对行号。
+        if (table instanceof DataTable) {
+            columns.add(new ConnectorColumn(PAIMON_FILE_PATH_COL, ConnectorType.of("STRING"),
+                    "", false, null, false).invisible().withUniqueId(PAIMON_FILE_PATH_FIELD_ID)
+                    .reservedPassthrough());
+            columns.add(new ConnectorColumn(PAIMON_ROW_INDEX_COL, ConnectorType.of("BIGINT"),
+                    "", false, null, false).invisible().withUniqueId(PAIMON_ROW_INDEX_FIELD_ID)
+                    .reservedPassthrough());
+        }
 
         // LinkedHashMap so the table-options order (used by SHOW CREATE TABLE's PROPERTIES) is
         // deterministic across runs.
@@ -1159,10 +1173,10 @@ public class PaimonConnectorMetadata implements ConnectorMetadata {
         if (!paimonHandle.isSystemTable()) {
             Optional<PaimonCatalogOps.PaimonSchemaSnapshot> latest = catalogOps.latestSchema(table);
             if (latest.isPresent()) {
-                return buildColumnHandles(latest.get().fields());
+                return buildColumnHandles(table, latest.get().fields());
             }
         }
-        return buildColumnHandles(table.rowType().getFields());
+        return buildColumnHandles(table, table.rowType().getFields());
     }
 
     /**
@@ -1188,8 +1202,8 @@ public class PaimonConnectorMetadata implements ConnectorMetadata {
             // return the BASE table's historical fields -- dropping the view's own columns (e.g. $audit_log's
             // leading `rowkind`). Build the handles from the pinned view's own rowType, the same source
             // systemTableSchemaAt binds the slots from, so the two cannot disagree.
-            return buildColumnHandles(
-                    resolveSystemTableAt(session, sysCandidate, snapshot).rowType().getFields());
+            Table table = resolveSystemTableAt(session, sysCandidate, snapshot);
+            return buildColumnHandles(table, table.rowType().getFields());
         }
         if (snapshot == null || snapshot.getSchemaId() < 0) {
             return getColumnHandles(session, handle);
@@ -1210,7 +1224,7 @@ public class PaimonConnectorMetadata implements ConnectorMetadata {
         // later base@same-schemaId read (each has its own independently-evolved schema-<id>).
         PaimonCatalogOps.PaimonSchemaSnapshot schema =
                 schemaAtMemo.getOrLoad(pinned, schemaId, () -> catalogOps.schemaAt(table, schemaId));
-        return buildColumnHandles(schema.fields());
+        return buildColumnHandles(table, schema.fields());
     }
 
     /**
@@ -1228,6 +1242,19 @@ public class PaimonConnectorMetadata implements ConnectorMetadata {
         for (int i = 0; i < fields.size(); i++) {
             String name = fields.get(i).name();
             handles.put(name, new PaimonColumnHandle(name, i));
+        }
+        return handles;
+    }
+
+    // 为数据表补充物理位置元数据列的投影句柄。
+    private static Map<String, ConnectorColumnHandle> buildColumnHandles(
+            Table table, List<DataField> fields) {
+        Map<String, ConnectorColumnHandle> handles = buildColumnHandles(fields);
+        if (table instanceof DataTable) {
+            handles.put(PAIMON_FILE_PATH_COL,
+                    new PaimonColumnHandle(PAIMON_FILE_PATH_COL, -1));
+            handles.put(PAIMON_ROW_INDEX_COL,
+                    new PaimonColumnHandle(PAIMON_ROW_INDEX_COL, -1));
         }
         return handles;
     }

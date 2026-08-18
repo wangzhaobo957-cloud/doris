@@ -53,6 +53,7 @@ import org.apache.doris.thrift.TTableDescriptor;
 import org.apache.doris.thrift.TTableType;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.MetadataTableUtils;
@@ -125,6 +126,17 @@ public class IcebergConnectorMetadata implements ConnectorMetadata {
     private static final int ICEBERG_ROW_ID_FIELD_ID = 2147483540;
     private static final int ICEBERG_LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID = 2147483539;
     private static final int ICEBERG_ROW_LINEAGE_MIN_VERSION = 3;
+
+    // Iceberg physical-location metadata columns (_file / _pos). Unlike row-lineage above, these are NOT gated
+    // on format-version: any iceberg table exposes the file path and in-file physical row position of every
+    // row. Names and reserved field ids mirror the iceberg spec's MetadataColumns.FILE_PATH / ROW_POSITION
+    // (org.apache.iceberg.MetadataColumns). _file is STRING (the original data-file path recorded in metadata),
+    // _pos is BIGINT (0-based absolute position within the physical file). Both are hidden and reservedPassthrough
+    // like the row-lineage columns; the same fe-core contract test that pins the row-lineage constants pins these.
+    private static final String ICEBERG_FILE_PATH_COL = "_file";
+    private static final String ICEBERG_ROW_POS_COL = "_pos";
+    private static final int ICEBERG_FILE_PATH_FIELD_ID = 2147483646;
+    private static final int ICEBERG_ROW_POS_FIELD_ID = 2147483645;
 
     // Snapshot-summary keys for table-level row count (getTableStatistics). Local literal copies of the
     // spec-stable iceberg strings — byte-identical to legacy IcebergUtils.TOTAL_*. These remain optimizer
@@ -495,6 +507,16 @@ public class IcebergConnectorMetadata implements ConnectorMetadata {
     private ConnectorTableSchema buildTableSchema(String tableName, Table table, Schema schema) {
         List<ConnectorColumn> columns = parseSchema(schema);
 
+        // 仅数据表具备可由 native reader 合成的文件路径和绝对行号。
+        if (!(table instanceof BaseMetadataTable)) {
+            columns.add(new ConnectorColumn(ICEBERG_FILE_PATH_COL, ConnectorType.of("STRING"),
+                    "", false, null, false).invisible().withUniqueId(ICEBERG_FILE_PATH_FIELD_ID)
+                    .reservedPassthrough());
+            columns.add(new ConnectorColumn(ICEBERG_ROW_POS_COL, ConnectorType.of("BIGINT"),
+                    "", false, null, false).invisible().withUniqueId(ICEBERG_ROW_POS_FIELD_ID)
+                    .reservedPassthrough());
+        }
+
         // Append the iceberg v3 row-lineage hidden columns (_row_id / _last_updated_sequence_number) for
         // format-version >= 3 tables, mirroring legacy IcebergUtils.appendRowLineageColumnsForV3 — invoked
         // unconditionally (format-gated) from IcebergExternalTable.getFullSchema. They are BIGINT, nullable,
@@ -718,7 +740,11 @@ public class IcebergConnectorMetadata implements ConnectorMetadata {
         // metadata-table columns (t$snapshots -> committed_at/...) so the generic scan node can look up
         // its pruned sys-table slots by name; a data handle resolves the base table's columns.
         Table table = iceHandle.isSystemTable() ? loadSysTable(session, iceHandle) : loadTable(session, iceHandle);
-        return buildColumnHandles(table.schema());
+        Map<String, ConnectorColumnHandle> handles = buildColumnHandles(table.schema());
+        if (!(table instanceof BaseMetadataTable)) {
+            appendFileMetadataColumnHandles(handles);
+        }
+        return handles;
     }
 
     @Override
@@ -733,7 +759,10 @@ public class IcebergConnectorMetadata implements ConnectorMetadata {
         Schema schema = table.currentSnapshot() == null
                 ? table.schema() : table.schemas().get((int) snapshot.getSchemaId());
         // Keep the handle-schema fallback identical to getTableSchema so slots and handles cannot diverge.
-        return buildColumnHandles(schema == null ? table.schema() : schema);
+        Map<String, ConnectorColumnHandle> handles =
+                buildColumnHandles(schema == null ? table.schema() : schema);
+        appendFileMetadataColumnHandles(handles);
+        return handles;
     }
 
     @Override
@@ -749,6 +778,14 @@ public class IcebergConnectorMetadata implements ConnectorMetadata {
             handles.put(name, new IcebergColumnHandle(name, field.fieldId()));
         }
         return handles;
+    }
+
+    // 为数据表补充物理位置元数据列的投影句柄。
+    private static void appendFileMetadataColumnHandles(Map<String, ConnectorColumnHandle> handles) {
+        handles.put(ICEBERG_FILE_PATH_COL,
+                new IcebergColumnHandle(ICEBERG_FILE_PATH_COL, ICEBERG_FILE_PATH_FIELD_ID));
+        handles.put(ICEBERG_ROW_POS_COL,
+                new IcebergColumnHandle(ICEBERG_ROW_POS_COL, ICEBERG_ROW_POS_FIELD_ID));
     }
 
     /**

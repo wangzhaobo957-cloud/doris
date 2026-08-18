@@ -1965,6 +1965,132 @@ TEST(ColumnMapperConstantTest, ByFieldIdDoesNotTreatSameNameDifferentIdAsRowLine
     EXPECT_EQ(mapper.mappings()[1].filter_conversion, FilterConversionType::COPY_DIRECTLY);
 }
 
+TEST(ColumnMapperConstantTest, FileMetadataColumnsAreVirtualByName) {
+    const std::vector<ColumnDefinition> iceberg_schema = {
+            name_col("_file", make_nullable(str())),
+            name_col("_pos", make_nullable(i64())),
+    };
+    const std::vector<ColumnDefinition> paimon_schema = {
+            name_col("__paimon_file_path", make_nullable(str())),
+            name_col("__paimon_row_index", make_nullable(i64())),
+    };
+
+    for (const auto& [flavor, schema] :
+         {std::pair {FileMetadataColumnFlavor::ICEBERG, iceberg_schema},
+          std::pair {FileMetadataColumnFlavor::PAIMON, paimon_schema}}) {
+        TableColumnMapper mapper(
+                {.mode = TableColumnMappingMode::BY_NAME, .file_metadata_column_flavor = flavor});
+        ASSERT_TRUE(mapper.create_mapping(schema, {}, {}).ok());
+        ASSERT_EQ(mapper.mappings().size(), 2);
+        for (const auto& mapping : mapper.mappings()) {
+            EXPECT_NE(mapping.virtual_column_type, TableVirtualColumnType::INVALID);
+            EXPECT_FALSE(mapping.file_local_id.has_value());
+            EXPECT_EQ(mapping.filter_conversion, FilterConversionType::FINALIZE_ONLY);
+        }
+    }
+}
+
+TEST(ColumnMapperConstantTest, FileMetadataColumnsAreVirtualByFieldId) {
+    const std::vector<ColumnDefinition> iceberg_schema = {
+            field_id_col("renamed_file", 2147483646, make_nullable(str())),
+            field_id_col("renamed_pos", 2147483645, make_nullable(i64())),
+    };
+    const std::vector<ColumnDefinition> paimon_schema = {
+            field_id_col("renamed_paimon_file", 2147483644, make_nullable(str())),
+            field_id_col("renamed_paimon_index", 2147483643, make_nullable(i64())),
+    };
+
+    for (const auto& [flavor, schema] :
+         {std::pair {FileMetadataColumnFlavor::ICEBERG, iceberg_schema},
+          std::pair {FileMetadataColumnFlavor::PAIMON, paimon_schema}}) {
+        TableColumnMapper mapper(
+                {.mode = TableColumnMappingMode::BY_FIELD_ID,
+                 .file_metadata_column_flavor = flavor});
+        ASSERT_TRUE(mapper.create_mapping(schema, {}, {}).ok());
+        ASSERT_EQ(mapper.mappings().size(), 2);
+        for (const auto& mapping : mapper.mappings()) {
+            EXPECT_NE(mapping.virtual_column_type, TableVirtualColumnType::INVALID);
+            EXPECT_FALSE(mapping.file_local_id.has_value());
+            EXPECT_EQ(mapping.filter_conversion, FilterConversionType::FINALIZE_ONLY);
+        }
+    }
+}
+
+TEST(ColumnMapperConstantTest, FileMetadataColumnsOverrideSameNamedPhysicalColumns) {
+    const std::vector<ColumnDefinition> table_schema = {
+            name_col("_file", make_nullable(str())),
+            name_col("_pos", make_nullable(i64())),
+    };
+    const std::vector<ColumnDefinition> file_schema = {
+            name_col("_file", make_nullable(str()), 0),
+            name_col("_pos", make_nullable(i64()), 1),
+    };
+
+    TableColumnMapper mapper(
+            {.mode = TableColumnMappingMode::BY_NAME,
+             .file_metadata_column_flavor = FileMetadataColumnFlavor::ICEBERG});
+    ASSERT_TRUE(mapper.create_mapping(table_schema, {}, file_schema).ok());
+
+    ASSERT_EQ(mapper.mappings().size(), 2);
+    for (const auto& mapping : mapper.mappings()) {
+        EXPECT_NE(mapping.virtual_column_type, TableVirtualColumnType::INVALID);
+        EXPECT_FALSE(mapping.file_local_id.has_value());
+        EXPECT_EQ(mapping.filter_conversion, FilterConversionType::FINALIZE_ONLY);
+    }
+}
+
+TEST(ColumnMapperConstantTest, FileMetadataColumnsStayPhysicalWhenFeatureIsDisabled) {
+    const std::vector<ColumnDefinition> table_schema = {
+            name_col("_file", make_nullable(str())),
+            name_col("_pos", make_nullable(i64())),
+    };
+    const std::vector<ColumnDefinition> file_schema = {
+            name_col("_file", make_nullable(str()), 0),
+            name_col("_pos", make_nullable(i64()), 1),
+    };
+
+    TableColumnMapper mapper({.mode = TableColumnMappingMode::BY_NAME});
+    ASSERT_TRUE(mapper.create_mapping(table_schema, {}, file_schema).ok());
+
+    ASSERT_EQ(mapper.mappings().size(), 2);
+    for (const auto& mapping : mapper.mappings()) {
+        EXPECT_EQ(mapping.virtual_column_type, TableVirtualColumnType::INVALID);
+        EXPECT_TRUE(mapping.file_local_id.has_value());
+        EXPECT_EQ(mapping.filter_conversion, FilterConversionType::COPY_DIRECTLY);
+    }
+}
+
+TEST(ColumnMapperConstantTest, FileMetadataColumnsStayPhysicalForOtherTableFormat) {
+    const std::vector<ColumnDefinition> table_schema = {
+            name_col("_file", make_nullable(str())),
+            name_col("__paimon_file_path", make_nullable(str())),
+    };
+    const std::vector<ColumnDefinition> file_schema = {
+            name_col("_file", make_nullable(str()), 0),
+            name_col("__paimon_file_path", make_nullable(str()), 1),
+    };
+
+    TableColumnMapper iceberg_mapper(
+            {.mode = TableColumnMappingMode::BY_NAME,
+             .file_metadata_column_flavor = FileMetadataColumnFlavor::ICEBERG});
+    ASSERT_TRUE(iceberg_mapper.create_mapping(table_schema, {}, file_schema).ok());
+    EXPECT_NE(iceberg_mapper.mappings()[0].virtual_column_type,
+              TableVirtualColumnType::INVALID);
+    EXPECT_EQ(iceberg_mapper.mappings()[1].virtual_column_type,
+              TableVirtualColumnType::INVALID);
+    EXPECT_TRUE(iceberg_mapper.mappings()[1].file_local_id.has_value());
+
+    TableColumnMapper paimon_mapper(
+            {.mode = TableColumnMappingMode::BY_NAME,
+             .file_metadata_column_flavor = FileMetadataColumnFlavor::PAIMON});
+    ASSERT_TRUE(paimon_mapper.create_mapping(table_schema, {}, file_schema).ok());
+    EXPECT_EQ(paimon_mapper.mappings()[0].virtual_column_type,
+              TableVirtualColumnType::INVALID);
+    EXPECT_TRUE(paimon_mapper.mappings()[0].file_local_id.has_value());
+    EXPECT_NE(paimon_mapper.mappings()[1].virtual_column_type,
+              TableVirtualColumnType::INVALID);
+}
+
 TEST(ColumnMapperConstantTest, PartitionAliasResolvesRenamedValue) {
     auto partition_column = name_col("current_dt", str());
     partition_column.name_mapping = {"legacy_dt"};

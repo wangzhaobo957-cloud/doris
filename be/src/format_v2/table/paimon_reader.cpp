@@ -24,22 +24,38 @@
 #include <string>
 #include <utility>
 
+#include "core/assert_cast.h"
+#include "core/column/column_nullable.h"
+#include "core/column/column_vector.h"
 #include "core/data_type/data_type_array.h"
 #include "core/data_type/data_type_factory.hpp"
 #include "core/data_type/data_type_map.h"
 #include "core/data_type/data_type_nullable.h"
 #include "core/data_type/data_type_struct.h"
 #include "core/data_type/data_type_variant_v2.h"
+#include "core/field.h"
 #include "exprs/vexpr_context.h"
 #include "format/table/deletion_vector_reader.h"
 #include "format/table/paimon_reader.h"
+#include "format_v2/column_data.h"
 #include "format_v2/column_mapper.h"
 #include "format_v2/jni/paimon_jni_reader.h"
 #include "format_v2/table/schema_history_util.h"
 #include "gen_cpp/PlanNodes_types.h"
 
 namespace doris::format::paimon {
+
+static constexpr const char* PAIMON_FILE_METADATA_ROW_POS = "__paimon_row_index";
+static constexpr int32_t PAIMON_FILE_METADATA_ROW_POS_FIELD_ID = 2147483643;
+
 namespace {
+
+// 判断投影列是否为 Paimon 物理行号列。
+bool is_projected_file_row_pos(const format::ColumnDefinition& column) {
+    return column.name == PAIMON_FILE_METADATA_ROW_POS ||
+           (column.has_identifier_field_id() &&
+            column.get_identifier_field_id() == PAIMON_FILE_METADATA_ROW_POS_FIELD_ID);
+}
 
 DataTypePtr nullable_like_original(const DataTypePtr& original, DataTypePtr nested) {
     return original != nullptr && original->is_nullable() ? make_nullable(nested) : nested;
@@ -230,6 +246,9 @@ Status PaimonReader::prepare_split(const format::SplitReadOptions& options) {
         SCOPED_TIMER(_profile.prepare_split_timer);
         _split_schema_id = -1;
         const auto& paimon_params = options.current_range.table_format_params.paimon_params;
+        _original_file_path = paimon_params.__isset.original_file_path
+                                      ? paimon_params.original_file_path
+                                      : options.current_range.path;
         if (paimon_params.__isset.schema_id) {
             _split_schema_id = paimon_params.schema_id;
         }
@@ -281,6 +300,9 @@ Status PaimonReader::customize_file_scan_request(format::FileScanRequest* file_r
     DORIS_CHECK(file_request != nullptr);
     RETURN_IF_ERROR(format::TableReader::customize_file_scan_request(file_request));
     file_request->variant_schema_overrides = _variant_schema_overrides;
+    if (_need_file_row_pos()) {
+        RETURN_IF_ERROR(_append_row_position_output_column(file_request));
+    }
     return Status::OK();
 }
 
@@ -305,6 +327,90 @@ Status PaimonReader::_parse_deletion_vector_file(const TTableFormatFileDesc& t_d
     desc->format = DeleteFileDesc::Format::PAIMON;
     *has_delete_file = true;
     return Status::OK();
+}
+
+// 返回当前 native split 的数据文件路径。
+std::string PaimonReader::_data_file_path() const {
+    DORIS_CHECK(!_original_file_path.empty());
+    return _original_file_path;
+}
+
+// 根据列映射生成 Paimon 物理位置元数据列。
+Status PaimonReader::materialize_virtual_columns(Block* table_block) {
+    for (size_t column_idx = 0; column_idx < _data_reader.column_mapper->mappings().size();
+         ++column_idx) {
+        const auto& mapping = _data_reader.column_mapper->mappings()[column_idx];
+        switch (mapping.virtual_column_type) {
+        case format::TableVirtualColumnType::FILE_PATH:
+            RETURN_IF_ERROR(_materialize_file_path(table_block, column_idx));
+            break;
+        case format::TableVirtualColumnType::FILE_ROW_POS:
+            RETURN_IF_ERROR(_materialize_file_row_pos(table_block, column_idx));
+            break;
+        case format::TableVirtualColumnType::ROW_ID:
+        case format::TableVirtualColumnType::LAST_UPDATED_SEQUENCE_NUMBER:
+        case format::TableVirtualColumnType::ICEBERG_ROWID:
+        case format::TableVirtualColumnType::INVALID:
+            break;
+        }
+    }
+    return Status::OK();
+}
+
+// 请求底层文件读取器输出绝对行号并记录其块位置。
+Status PaimonReader::_append_row_position_output_column(format::FileScanRequest* request) {
+    const auto row_position_column_id = format::LocalColumnId(format::ROW_POSITION_COLUMN_ID);
+    _append_file_scan_column(request, row_position_column_id, &request->non_predicate_columns);
+    _row_position_block_position = request->local_positions.at(row_position_column_id).value();
+    return Status::OK();
+}
+
+// 为当前批次填充数据文件路径。
+Status PaimonReader::_materialize_file_path(Block* table_block, size_t column_idx) {
+    const auto rows = table_block->rows();
+    const auto file_path = _data_file_path();
+    const auto& type = table_block->get_by_position(column_idx).type;
+    table_block->replace_by_position(
+            column_idx,
+            type->create_column_const(rows, Field::create_field<TYPE_STRING>(file_path)));
+    return Status::OK();
+}
+
+// 将文件读取器生成的绝对行号复制到结果列。
+Status PaimonReader::_materialize_file_row_pos(Block* table_block, size_t column_idx) {
+    DORIS_CHECK(_row_position_block_position < _data_reader.block_template.columns());
+    const auto& row_position_column = assert_cast<const ColumnInt64&>(
+            *_data_reader.block_template.get_by_position(_row_position_block_position).column);
+    DORIS_CHECK(row_position_column.size() == table_block->rows());
+
+    const auto& type = table_block->get_by_position(column_idx).type;
+    auto column = type->create_column();
+    auto* nullable_column = check_and_get_column<ColumnNullable>(column.get());
+    auto* nested = nullable_column != nullptr ? nullable_column->get_nested_column_ptr().get()
+                                               : column.get();
+    auto& data = assert_cast<ColumnInt64&>(*nested).get_data();
+    const auto rows = row_position_column.size();
+    data.resize(rows);
+    for (size_t row = 0; row < rows; ++row) {
+        data[row] = row_position_column.get_element(row);
+    }
+    if (nullable_column != nullptr) {
+        nullable_column->get_null_map_data().resize_fill(rows, 0);
+    }
+    table_block->replace_by_position(column_idx, std::move(column));
+    return Status::OK();
+}
+
+// 判断是否需要让底层文件读取器输出绝对行号。
+bool PaimonReader::_need_file_row_pos() const {
+    if (_data_reader.column_mapper != nullptr) {
+        for (const auto& mapping : _data_reader.column_mapper->mappings()) {
+            if (mapping.virtual_column_type == format::TableVirtualColumnType::FILE_ROW_POS) {
+                return true;
+            }
+        }
+    }
+    return std::ranges::any_of(_projected_columns, is_projected_file_row_pos);
 }
 
 Status PaimonHybridReader::init(format::TableReadOptions&& options) {

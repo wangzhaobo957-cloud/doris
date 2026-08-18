@@ -63,6 +63,15 @@ public class IcebergScanPlanProviderClassifyColumnTest {
                 PROVIDER.classifyColumn("_last_updated_sequence_number"));
     }
 
+    // 验证物理位置元数据列由 BE 合成，且列名匹配不区分大小写。
+    @Test
+    public void physicalLocationMetadataColumnsAreSynthesized() {
+        Assertions.assertEquals(ConnectorColumnCategory.SYNTHESIZED, PROVIDER.classifyColumn("_file"));
+        Assertions.assertEquals(ConnectorColumnCategory.SYNTHESIZED, PROVIDER.classifyColumn("_pos"));
+        Assertions.assertEquals(ConnectorColumnCategory.SYNTHESIZED, PROVIDER.classifyColumn("_FILE"));
+        Assertions.assertEquals(ConnectorColumnCategory.SYNTHESIZED, PROVIDER.classifyColumn("_POS"));
+    }
+
     @Test
     public void globalRowIdIsNotClaimedByConnector() {
         // WHY: GLOBAL_ROWID is a generic Doris lazy-mat mechanism owned by the generic node, NOT iceberg.

@@ -139,6 +139,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
     // channel) since the connector cannot import fe-core SessionVariable. Keys + defaults are byte-identical to
     // SessionVariable and to the paimon connector's constants.
     private static final String FILE_SPLIT_SIZE = "file_split_size";
+    private static final String ENABLE_FILE_SCANNER_V2 = "enable_file_scanner_v2";
     private static final String MAX_INITIAL_FILE_SPLIT_SIZE = "max_initial_file_split_size";
     private static final String MAX_FILE_SPLIT_SIZE = "max_file_split_size";
     private static final String MAX_INITIAL_FILE_SPLIT_NUM = "max_initial_file_split_num";
@@ -172,6 +173,8 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
     private static final String DORIS_ICEBERG_ROWID_COL = "__DORIS_ICEBERG_ROWID_COL__";
     private static final String ICEBERG_ROW_ID_COL = "_row_id";
     private static final String ICEBERG_LAST_UPDATED_SEQUENCE_NUMBER_COL = "_last_updated_sequence_number";
+    private static final String ICEBERG_FILE_PATH_COL = "_file";
+    private static final String ICEBERG_ROW_POS_COL = "_pos";
 
     // #65784: version marker (TFileScanRangeParams.iceberg_scan_semantics_version) advertising that this plan
     // was produced by an FE honoring authoritative iceberg name mappings + logical initial-default
@@ -391,7 +394,9 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
      */
     @Override
     public ConnectorColumnCategory classifyColumn(String columnName) {
-        if (DORIS_ICEBERG_ROWID_COL.equalsIgnoreCase(columnName)) {
+        if (DORIS_ICEBERG_ROWID_COL.equalsIgnoreCase(columnName)
+                || ICEBERG_FILE_PATH_COL.equalsIgnoreCase(columnName)
+                || ICEBERG_ROW_POS_COL.equalsIgnoreCase(columnName)) {
             return ConnectorColumnCategory.SYNTHESIZED;
         }
         if (ICEBERG_ROW_ID_COL.equalsIgnoreCase(columnName)
@@ -399,6 +404,19 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
             return ConnectorColumnCategory.GENERATED;
         }
         return ConnectorColumnCategory.DEFAULT;
+    }
+
+    /**
+     * 返回查询显式引用的第一个物理位置元数据列。
+     */
+    private static Optional<String> fileMetadataColumn(List<ConnectorColumnHandle> columns) {
+        return columns.stream()
+                .filter(IcebergColumnHandle.class::isInstance)
+                .map(IcebergColumnHandle.class::cast)
+                .map(IcebergColumnHandle::getName)
+                .filter(name -> ICEBERG_FILE_PATH_COL.equalsIgnoreCase(name)
+                        || ICEBERG_ROW_POS_COL.equalsIgnoreCase(name))
+                .findFirst();
     }
 
     @Override
@@ -518,6 +536,12 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
     public ConnectorSplitSource streamSplits(ConnectorSession session, ConnectorTableHandle handle,
             List<ConnectorColumnHandle> columns, Optional<ConnectorExpression> filter, long limit) {
         IcebergTableHandle iceHandle = (IcebergTableHandle) handle;
+        Optional<String> metadataColumn = fileMetadataColumn(columns);
+        if (metadataColumn.isPresent() && !sessionBool(session, ENABLE_FILE_SCANNER_V2, true)) {
+            throw new DorisConnectorException("Metadata column '" + metadataColumn.get()
+                    + "' is only supported by FileScannerV2 native Parquet/ORC reader for Iceberg; "
+                    + "actual reader is FileScannerV1.");
+        }
         if (iceHandle.isResolvedEmptySnapshot()) {
             // The batch decision is made before the engine pins MVCC; once pinned empty, streaming must
             // preserve that boundary instead of interpreting Iceberg's sentinel as the latest snapshot.
@@ -540,7 +564,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
                     scan, session, table, filter, sliceSize);
             return new IcebergStreamingSplitSource(tasks, table, formatVersion, partitioned,
                     orderedPartitionKeys, zone, uriNormalizer, sliceSize,
-                    iceHandle.getRewriteFileScope(), iceHandle);
+                    iceHandle.getRewriteFileScope(), iceHandle, metadataColumn);
         } catch (RuntimeException e) {
             throw IcebergExceptionUtils.wrapMetadataReadFailure(iceHandle, e);
         }
@@ -605,6 +629,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
         private final long sliceSize;
         private final Set<String> rewriteScope;
         private final IcebergTableHandle handle;
+        private final Optional<String> metadataColumn;
         // Lazily opened on first hasNext() so the ctor never throws — iceberg's ParallelIterable submits
         // manifest readers in tasks.iterator(), which can fail; opening it eagerly here would throw out of
         // streamSplits() BEFORE the source is returned, leaking the planFiles() iterable (the engine pump's
@@ -620,7 +645,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
         IcebergStreamingSplitSource(CloseableIterable<FileScanTask> tasks, Table table, int formatVersion,
                 boolean partitioned, List<String> orderedPartitionKeys, ZoneId zone,
                 UnaryOperator<String> uriNormalizer, long sliceSize, Set<String> rewriteScope,
-                IcebergTableHandle handle) {
+                IcebergTableHandle handle, Optional<String> metadataColumn) {
             this.tasks = tasks;
             this.table = table;
             this.formatVersion = formatVersion;
@@ -631,6 +656,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
             this.sliceSize = sliceSize;
             this.rewriteScope = rewriteScope;
             this.handle = handle;
+            this.metadataColumn = metadataColumn;
         }
 
         @Override
@@ -644,7 +670,8 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
                 }
                 while (iterator.hasNext()) {
                     IcebergScanRange range = buildRangeForTask(iterator.next(), table, formatVersion, partitioned,
-                            orderedPartitionKeys, zone, uriNormalizer, sliceSize, rewriteScope, null, scratch);
+                            orderedPartitionKeys, zone, uriNormalizer, sliceSize, rewriteScope, null, scratch,
+                            metadataColumn);
                     if (range != null) {
                         buffered = range;
                         return true;
@@ -686,6 +713,15 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
             Optional<ConnectorExpression> filter,
             boolean countPushdown) {
         IcebergTableHandle iceHandle = (IcebergTableHandle) handle;
+        Optional<String> metadataColumn = fileMetadataColumn(columns);
+        if (metadataColumn.isPresent()) {
+            if (!sessionBool(session, ENABLE_FILE_SCANNER_V2, true)) {
+                throw new DorisConnectorException("Metadata column '" + metadataColumn.get()
+                        + "' is only supported by FileScannerV2 native Parquet/ORC reader for Iceberg; "
+                        + "actual reader is FileScannerV1.");
+            }
+            countPushdown = false;
+        }
         if (iceHandle.isResolvedEmptySnapshot() && !isSnapshotIndependentSystemTable(iceHandle)) {
             // Iceberg has no snapshot id that can represent "before the first commit". Returning no ranges is
             // the read-side MVCC fence; otherwise a refreshed Table would turn -1 into "latest" and expose a
@@ -778,7 +814,7 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
                 // identical to the streaming path's IcebergStreamingSplitSource so both produce the same ranges.
                 IcebergScanRange range = buildRangeForTask(task, table, formatVersion, partitioned,
                         orderedPartitionKeys, zone, uriNormalizer, plan.targetSplitSize, rewriteScope,
-                        rewritableDeleteSupply, scratch);
+                        rewritableDeleteSupply, scratch, metadataColumn);
                 if (range != null) {
                     ranges.add(range);
                 }
@@ -837,10 +873,17 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
     private IcebergScanRange buildRangeForTask(FileScanTask task, Table table, int formatVersion,
             boolean partitioned, List<String> orderedPartitionKeys, ZoneId zone,
             UnaryOperator<String> uriNormalizer, long targetSplitSize, Set<String> rewriteScope,
-            Map<String, List<TIcebergDeleteFileDesc>> rewritableDeleteSupply, PerFileScratch scratch) {
+            Map<String, List<TIcebergDeleteFileDesc>> rewritableDeleteSupply, PerFileScratch scratch,
+            Optional<String> metadataColumn) {
         DataFile dataFile = task.file();
         if (rewriteScope != null && !rewriteScope.contains(dataFile.path().toString())) {
             return null;
+        }
+        if (metadataColumn.isPresent() && dataFile.format() != FileFormat.PARQUET
+                && dataFile.format() != FileFormat.ORC) {
+            throw new DorisConnectorException("Metadata column '" + metadataColumn.get()
+                    + "' is only supported by FileScannerV2 native Parquet/ORC reader for Iceberg; "
+                    + "actual reader is " + dataFile.format() + ".");
         }
         // First byte-slice of a new data file? (scratch still holds the previous file until buildRange refreshes
         // it below — so capture this BEFORE the buildRange call.) The v3 rewritable-delete supply is identical
@@ -2056,7 +2099,11 @@ public class IcebergScanPlanProvider implements ConnectorScanPlanProvider {
         }
         List<String> names = new ArrayList<>(columns.size());
         for (ConnectorColumnHandle column : columns) {
-            names.add(((IcebergColumnHandle) column).getName());
+            String name = ((IcebergColumnHandle) column).getName();
+            if (!ICEBERG_FILE_PATH_COL.equalsIgnoreCase(name)
+                    && !ICEBERG_ROW_POS_COL.equalsIgnoreCase(name)) {
+                names.add(name);
+            }
         }
         return names;
     }

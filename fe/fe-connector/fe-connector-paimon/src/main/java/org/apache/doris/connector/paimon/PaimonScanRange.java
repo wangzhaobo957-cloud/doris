@@ -52,6 +52,7 @@ public class PaimonScanRange implements ConnectorScanRange {
     private static final long serialVersionUID = 1L;
 
     private final String path;
+    private final String originalPath;
     private final long start;
     private final long length;
     private final long fileSize;
@@ -66,6 +67,7 @@ public class PaimonScanRange implements ConnectorScanRange {
 
     private PaimonScanRange(Builder builder) {
         this.path = builder.path;
+        this.originalPath = builder.originalPath != null ? builder.originalPath : builder.path;
         this.start = builder.start;
         this.length = builder.length;
         this.fileSize = builder.fileSize;
@@ -236,6 +238,7 @@ public class PaimonScanRange implements ConnectorScanRange {
             if (schemaIdStr != null) {
                 fileDesc.setSchemaId(Long.parseLong(schemaIdStr));
             }
+            fileDesc.setOriginalFilePath(originalPath);
         }
 
         fileDesc.setFileFormat(getFileFormat());
@@ -294,6 +297,7 @@ public class PaimonScanRange implements ConnectorScanRange {
     /** Builder for constructing PaimonScanRange instances. */
     public static class Builder {
         private String path;
+        private String originalPath;
         private long start;
         private long length = -1;
         private long fileSize = -1;
@@ -325,6 +329,12 @@ public class PaimonScanRange implements ConnectorScanRange {
 
         public Builder path(String path) {
             this.path = path;
+            return this;
+        }
+
+        /** 设置存储 URI 规范化前的 RawFile 原始路径。 */
+        public Builder originalPath(String originalPath) {
+            this.originalPath = originalPath;
             return this;
         }
 

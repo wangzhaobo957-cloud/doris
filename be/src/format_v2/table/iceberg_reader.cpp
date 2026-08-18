@@ -63,6 +63,8 @@ namespace doris::format::iceberg {
 
 static constexpr const char* ROW_LINEAGE_ROW_ID = "_row_id";
 static constexpr int32_t ROW_LINEAGE_ROW_ID_FIELD_ID = 2147483540;
+static constexpr const char* FILE_METADATA_ROW_POS = "_pos";
+static constexpr int32_t FILE_METADATA_ROW_POS_FIELD_ID = 2147483645;
 
 namespace {
 
@@ -181,6 +183,13 @@ static bool is_projected_row_lineage_row_id(const format::ColumnDefinition& colu
 
 static bool is_projected_iceberg_rowid(const format::ColumnDefinition& column) {
     return column.name == BeConsts::ICEBERG_ROWID_COL;
+}
+
+// 判断投影列是否为 Iceberg 物理行号列。
+static bool is_projected_file_row_pos(const format::ColumnDefinition& column) {
+    return column.name == FILE_METADATA_ROW_POS ||
+           (column.has_identifier_field_id() &&
+            column.get_identifier_field_id() == FILE_METADATA_ROW_POS_FIELD_ID);
 }
 
 static int iceberg_hex_value(char value) {
@@ -1102,6 +1111,12 @@ Status IcebergTableReader::materialize_virtual_columns(Block* table_block) {
         case format::TableVirtualColumnType::ICEBERG_ROWID:
             RETURN_IF_ERROR(_materialize_iceberg_rowid(table_block, column_idx));
             break;
+        case format::TableVirtualColumnType::FILE_PATH:
+            RETURN_IF_ERROR(_materialize_file_path(table_block, column_idx));
+            break;
+        case format::TableVirtualColumnType::FILE_ROW_POS:
+            RETURN_IF_ERROR(_materialize_file_row_pos(table_block, column_idx));
+            break;
         case format::TableVirtualColumnType::INVALID:
             break;
         }
@@ -1112,7 +1127,7 @@ Status IcebergTableReader::materialize_virtual_columns(Block* table_block) {
 Status IcebergTableReader::customize_file_scan_request(format::FileScanRequest* file_request) {
     RETURN_IF_ERROR(TableReader::customize_file_scan_request(file_request));
     if ((_row_lineage_columns.first_row_id >= 0 && _need_row_lineage_row_id()) ||
-        _need_iceberg_rowid()) {
+        _need_iceberg_rowid() || _need_file_row_pos()) {
         RETURN_IF_ERROR(_append_row_position_output_column(file_request));
     }
     RETURN_IF_ERROR(_append_equality_delete_predicates(file_request));
@@ -1909,6 +1924,42 @@ Status IcebergTableReader::_materialize_row_lineage_last_updated_sequence_number
     return Status::OK();
 }
 
+// 为当前批次填充数据文件路径。
+Status IcebergTableReader::_materialize_file_path(Block* table_block, size_t column_idx) {
+    const auto rows = table_block->rows();
+    const auto file_path = _data_file_path();
+    const auto& type = table_block->get_by_position(column_idx).type;
+    table_block->replace_by_position(
+            column_idx,
+            type->create_column_const(rows, Field::create_field<TYPE_STRING>(file_path)));
+    return Status::OK();
+}
+
+// 将文件读取器生成的绝对行号复制到结果列。
+Status IcebergTableReader::_materialize_file_row_pos(Block* table_block, size_t column_idx) {
+    DORIS_CHECK(_row_position_block_position < _data_reader.block_template.columns());
+    const auto& row_position_column = assert_cast<const ColumnInt64&>(
+            *_data_reader.block_template.get_by_position(_row_position_block_position).column);
+    DORIS_CHECK(row_position_column.size() == table_block->rows());
+
+    const auto& type = table_block->get_by_position(column_idx).type;
+    auto column = type->create_column();
+    auto* nullable_column = check_and_get_column<ColumnNullable>(column.get());
+    auto* nested = nullable_column != nullptr ? nullable_column->get_nested_column_ptr().get()
+                                               : column.get();
+    auto& data = assert_cast<ColumnInt64&>(*nested).get_data();
+    const auto rows = row_position_column.size();
+    data.resize(rows);
+    for (size_t row = 0; row < rows; ++row) {
+        data[row] = row_position_column.get_element(row);
+    }
+    if (nullable_column != nullptr) {
+        nullable_column->get_null_map_data().resize_fill(rows, 0);
+    }
+    table_block->replace_by_position(column_idx, std::move(column));
+    return Status::OK();
+}
+
 bool IcebergTableReader::_need_row_lineage_row_id() const {
     if (_data_reader.column_mapper != nullptr) {
         for (const auto& mapping : _data_reader.column_mapper->mappings()) {
@@ -1929,6 +1980,18 @@ bool IcebergTableReader::_need_iceberg_rowid() const {
         }
     }
     return std::ranges::any_of(_projected_columns, is_projected_iceberg_rowid);
+}
+
+// 判断是否需要让底层文件读取器输出绝对行号。
+bool IcebergTableReader::_need_file_row_pos() const {
+    if (_data_reader.column_mapper != nullptr) {
+        for (const auto& mapping : _data_reader.column_mapper->mappings()) {
+            if (mapping.virtual_column_type == format::TableVirtualColumnType::FILE_ROW_POS) {
+                return true;
+            }
+        }
+    }
+    return std::ranges::any_of(_projected_columns, is_projected_file_row_pos);
 }
 
 } // namespace doris::format::iceberg

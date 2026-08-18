@@ -1259,6 +1259,16 @@ public class PaimonScanPlanProviderTest {
                         "a JNI range must carry the real data-file format, not \"jni\"");
             }
 
+            // 引用物理位置元数据列时不能退回 JNI，否则 BE 会返回 NULL 或部分结果。
+            DorisConnectorException metadataError = Assertions.assertThrows(
+                    DorisConnectorException.class,
+                    () -> provider.planScan(forceJni,
+                            ConnectorScanRequest.builder(handle,
+                                    Collections.singletonList(
+                                            new PaimonColumnHandle("__paimon_file_path", -1)))
+                                    .countPushdown(false).build()));
+            Assertions.assertTrue(metadataError.getMessage().contains("FileScannerV2 native"));
+
             // (b) COUNT(*) collapse range (buildCountRange): same real-format requirement; also pins that
             // defaultFileFormat is threaded into buildCountRange's new parameter from the call site.
             ConnectorSession plain = sessionWithProps(Collections.emptyMap());
@@ -1275,6 +1285,18 @@ public class PaimonScanPlanProviderTest {
             // MUTATION: buildCountRange .fileFormat("jni"), or dropping the threaded defaultFileFormat -> red.
             Assertions.assertEquals("orc", countRange.getFileFormat(),
                     "the COUNT(*) collapse range must carry the real data-file format, not \"jni\"");
+
+            // 元数据列参与投影或谓词时必须扫描原始行，不能走 table-level COUNT 快捷路径。
+            List<ConnectorScanRange> metadataRanges = provider.planScan(plain,
+                    ConnectorScanRequest.builder(handle,
+                            Collections.singletonList(
+                                    new PaimonColumnHandle("__paimon_row_index", -1)))
+                            .countPushdown(true).build());
+            Assertions.assertFalse(metadataRanges.isEmpty());
+            for (ConnectorScanRange range : metadataRanges) {
+                Assertions.assertFalse(range.getProperties().containsKey("paimon.row_count"));
+                Assertions.assertTrue(range.isNativeReadRange());
+            }
         }
     }
 

@@ -81,7 +81,8 @@ public class PaimonScanRangeReaderTypeTest {
         // A native ORC/Parquet split: no paimonSplit marker -> native reader branch, always PAIMON_NATIVE.
         PaimonScanRange range = new PaimonScanRange.Builder()
                 .fileFormat("orc")
-                .path("s3://bkt/a/part-0.orc")
+                .path("s3://normalized-bkt/a/part-0.orc")
+                .originalPath("oss://raw-bkt/a/part-0.orc")
                 .schemaId(1L)
                 .build();
 
@@ -89,5 +90,7 @@ public class PaimonScanRangeReaderTypeTest {
         Assertions.assertTrue(formatDesc.getPaimonParams().isSetReaderType());
         Assertions.assertEquals(TPaimonReaderType.PAIMON_NATIVE,
                 formatDesc.getPaimonParams().getReaderType());
+        Assertions.assertEquals("oss://raw-bkt/a/part-0.orc",
+                formatDesc.getPaimonParams().getOriginalFilePath());
     }
 }
