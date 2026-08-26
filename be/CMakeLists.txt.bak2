@@ -881,7 +881,7 @@ endif()
 # NOTE(amos): This should come before -lc -lm to interpose symbols correctly.
 if (GLIBC_COMPATIBILITY)
     add_subdirectory(${SRC_DIR}/glibc-compatibility)
-    set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS})
+    set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} glibc-compatibility-explicit)
 endif()
 
 if (NOT OS_MACOSX)
